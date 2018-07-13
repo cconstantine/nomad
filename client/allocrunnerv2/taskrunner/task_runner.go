@@ -375,8 +375,12 @@ func (tr *TaskRunner) persistLocalState() error {
 	// Multiplex writes to both
 	w := io.MultiWriter(h, &buf)
 
+	// Strip out VaultToken
+	trState := tr.localState.Copy()
+	trState.VaultToken = ""
+
 	// Encode as msgpack value
-	if err := codec.NewEncoder(w, structs.MsgpackHandle).Encode(tr.localState); err != nil {
+	if err := codec.NewEncoder(w, structs.MsgpackHandle).Encode(trState); err != nil {
 		return fmt.Errorf("failed to serialize snapshot: %v", err)
 	}
 

@@ -12,8 +12,8 @@ import (
 	"github.com/hashicorp/nomad/client/allocrunnerv2/interfaces"
 	"github.com/hashicorp/nomad/client/allocrunnerv2/state"
 	"github.com/hashicorp/nomad/client/allocrunnerv2/taskrunner"
-	trstate "github.com/hashicorp/nomad/client/allocrunnerv2/taskrunner/state"
 	"github.com/hashicorp/nomad/client/config"
+	clientstate "github.com/hashicorp/nomad/client/state"
 	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
@@ -49,40 +49,66 @@ type allocRunner struct {
 	// tasks are the set of task runners
 	tasks map[string]*taskrunner.TaskRunner
 
-	//XXX spike to see if restore should just go through New funcs
-	restoredTasks map[string]*trstate.LocalState
-
 	// updateCh receives allocation updates via the Update method
 	updateCh chan *structs.Allocation
 }
 
 // NewAllocRunner returns a new allocation runner.
-func NewAllocRunner(config *Config) *allocRunner {
-	ar := &allocRunner{
-		alloc:         config.Alloc,
-		clientConfig:  config.ClientConfig,
-		tasks:         make(map[string]*taskrunner.TaskRunner),
-		waitCh:        make(chan struct{}),
-		updateCh:      make(chan *structs.Allocation),
-		stateDB:       config.StateDB,
-		restoredTasks: config.RestoredTasks,
+func NewAllocRunner(config *Config) (*allocRunner, error) {
+	alloc := config.Alloc
+	tg := alloc.Job.LookupTaskGroup(alloc.TaskGroup)
+	if tg == nil {
+		return nil, fmt.Errorf("failed to lookup task group %q", alloc.TaskGroup)
 	}
 
-	if ar.restoredTasks == nil {
-		ar.restoredTasks = make(map[string]*trstate.LocalState)
+	ar := &allocRunner{
+		alloc:        alloc,
+		clientConfig: config.ClientConfig,
+		tasks:        make(map[string]*taskrunner.TaskRunner, len(tg.Tasks)),
+		waitCh:       make(chan struct{}),
+		updateCh:     make(chan *structs.Allocation),
+		stateDB:      config.StateDB,
 	}
 
 	// Create alloc dir
 	//XXX update AllocDir to hc log
-	ar.allocDir = allocdir.NewAllocDir(nil, filepath.Join(config.ClientConfig.AllocDir, config.Alloc.ID))
+	ar.allocDir = allocdir.NewAllocDir(nil, filepath.Join(config.ClientConfig.AllocDir, alloc.ID))
 
 	// Create the logger based on the allocation ID
-	ar.logger = config.Logger.With("alloc_id", config.Alloc.ID)
+	ar.logger = config.Logger.With("alloc_id", alloc.ID)
 
 	// Initialize the runners hooks.
 	ar.initRunnerHooks()
 
-	return ar
+	// Create the TaskRunners
+	if err := ar.initTaskRunners(tg.Tasks); err != nil {
+		return nil, err
+	}
+
+	return ar, nil
+}
+
+// initTaskRunners creates task runners but does *not* run them.
+func (ar *allocRunner) initTaskRunners(tasks []*structs.Task) error {
+	for _, task := range tasks {
+		config := &taskrunner.Config{
+			Alloc:        ar.alloc,
+			ClientConfig: ar.clientConfig,
+			Task:         task,
+			TaskDir:      ar.allocDir.NewTaskDir(task.Name),
+			Logger:       ar.logger,
+			StateDB:      ar.stateDB,
+		}
+
+		// Create, but do not Run, the task runner
+		tr, err := taskrunner.NewTaskRunner(config)
+		if err != nil {
+			return fmt.Errorf("failed creating runner for task %q: %v", task.Name, err)
+		}
+
+		ar.tasks[task.Name] = tr
+	}
+	return nil
 }
 
 func (ar *allocRunner) WaitCh() <-chan struct{} {
@@ -95,7 +121,6 @@ func (ar *allocRunner) Run() {
 	// Close the wait channel
 	defer close(ar.waitCh)
 
-	var err error
 	var taskWaitCh <-chan struct{}
 
 	// Run the prerun hooks
@@ -106,10 +131,7 @@ func (ar *allocRunner) Run() {
 	}
 
 	// Run the runners
-	taskWaitCh, err = ar.runImpl()
-	if err != nil {
-		ar.logger.Error("starting tasks failed", "error", err)
-	}
+	taskWaitCh = ar.runImpl()
 
 	for {
 		select {
@@ -134,20 +156,9 @@ POST:
 }
 
 // runImpl is used to run the runners.
-func (ar *allocRunner) runImpl() (<-chan struct{}, error) {
-	// Grab the task group
-	alloc := ar.Alloc()
-	tg := alloc.Job.LookupTaskGroup(alloc.TaskGroup)
-	if tg == nil {
-		// XXX Fail and exit
-		ar.logger.Error("failed to lookup task group", "task_group", alloc.TaskGroup)
-		return nil, fmt.Errorf("failed to lookup task group %q", alloc.TaskGroup)
-	}
-
-	for _, task := range tg.Tasks {
-		if err := ar.runTask(alloc, task); err != nil {
-			return nil, err
-		}
+func (ar *allocRunner) runImpl() <-chan struct{} {
+	for _, task := range ar.tasks {
+		go task.Run()
 	}
 
 	// Return a combined WaitCh that is closed when all task runners have
@@ -160,32 +171,7 @@ func (ar *allocRunner) runImpl() (<-chan struct{}, error) {
 		}
 	}()
 
-	return waitCh, nil
-}
-
-// runTask is used to run a task.
-func (ar *allocRunner) runTask(alloc *structs.Allocation, task *structs.Task) error {
-	// Create the runner
-	config := &taskrunner.Config{
-		Alloc:        alloc,
-		ClientConfig: ar.clientConfig,
-		Task:         task,
-		TaskDir:      ar.allocDir.NewTaskDir(task.Name),
-		Logger:       ar.logger,
-		StateDB:      ar.stateDB,
-		LocalState:   ar.restoredTasks[task.Name],
-	}
-	tr, err := taskrunner.NewTaskRunner(config)
-	if err != nil {
-		return err
-	}
-
-	// Start the runner
-	go tr.Run()
-
-	// Store the runner
-	ar.tasks[task.Name] = tr
-	return nil
+	return waitCh
 }
 
 // Alloc returns the current allocation being run by this runner.
@@ -197,9 +183,29 @@ func (ar *allocRunner) Alloc() *structs.Allocation {
 }
 
 // SaveState does all the state related stuff. Who knows. FIXME
-//XXX
+//XXX do we need to do periodic syncing? if Saving is only called *before* Run
+//    *and* within Run -- *and* Updates are applid within Run -- we may be able to
+//    skip quite a bit of locking? maybe?
 func (ar *allocRunner) SaveState() error {
-	return nil
+	return ar.stateDB.Update(func(tx *bolt.Tx) error {
+		//XXX Track EvalID to only write alloc on change?
+		// Write the allocation
+		return clientstate.PutAllocation(tx, ar.Alloc())
+	})
+}
+
+// Restore state from database. Must be called after NewAllocRunner but before
+// Run.
+func (ar *allocRunner) Restore() error {
+	return ar.stateDB.View(func(tx *bolt.Tx) error {
+		// Restore task runners
+		for _, tr := range ar.tasks {
+			if err := tr.Restore(tx); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // Update the running allocation with a new version received from the server.

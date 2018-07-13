@@ -3,7 +3,6 @@ package allocrunnerv2
 import (
 	"github.com/boltdb/bolt"
 	log "github.com/hashicorp/go-hclog"
-	trstate "github.com/hashicorp/nomad/client/allocrunnerv2/taskrunner/state"
 	clientconfig "github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
@@ -21,10 +20,6 @@ type Config struct {
 
 	// StateDB is used to store and restore state.
 	StateDB *bolt.DB
-
-	//XXX spiking restoration via New funcs
-	// RestoredTasks is the restored task state or nil if not restoring
-	RestoredTasks map[string]*trstate.LocalState
 
 	// XXX Can have a OnStateTransistion hook that we can use to update the
 	// server

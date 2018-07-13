@@ -24,11 +24,10 @@ import (
 	"github.com/hashicorp/nomad/client/allocdir"
 	"github.com/hashicorp/nomad/client/allocrunner"
 	"github.com/hashicorp/nomad/client/allocrunnerv2"
-	"github.com/hashicorp/nomad/client/allocrunnerv2/state"
 	"github.com/hashicorp/nomad/client/config"
 	consulApi "github.com/hashicorp/nomad/client/consul"
 	"github.com/hashicorp/nomad/client/servers"
-	oldstate "github.com/hashicorp/nomad/client/state"
+	clientstate "github.com/hashicorp/nomad/client/state"
 	"github.com/hashicorp/nomad/client/stats"
 	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/client/vaultclient"
@@ -110,6 +109,8 @@ type AllocRunner interface {
 	SaveState() error
 	Update(*structs.Allocation)
 	Alloc() *structs.Allocation
+	Restore() error
+	Run()
 }
 
 // Client is used to implement the client interaction with Nomad. Clients
@@ -722,6 +723,7 @@ func (c *Client) restoreState() error {
 		return nil
 	}
 
+	//XXX REMOVED! make a note in backward compat / upgrading doc
 	// COMPAT: Remove in 0.7.0
 	// 0.6.0 transitioned from individual state files to a single bolt-db.
 	// The upgrade path is to:
@@ -729,46 +731,23 @@ func (c *Client) restoreState() error {
 	//   If so, restore from that and delete old state
 	// Restore using state database
 
-	// Allocs holds the IDs of the allocations being restored
-	var allocs []string
-
-	// Upgrading tracks whether this is a pre 0.6.0 upgrade path
-	var upgrading bool
-
-	// Scan the directory
-	allocDir := filepath.Join(c.config.StateDir, "alloc")
-	list, err := ioutil.ReadDir(allocDir)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to list alloc state: %v", err)
-	} else if err == nil && len(list) != 0 {
-		upgrading = true
-		for _, entry := range list {
-			allocs = append(allocs, entry.Name())
-		}
-	} else {
-		// Normal path
-		err := c.stateDB.View(func(tx *bolt.Tx) error {
-			allocs, err = oldstate.GetAllAllocationIDs(tx)
-			if err != nil {
-				return fmt.Errorf("failed to list allocations: %v", err)
-			}
-			return nil
-		})
+	// Restore allocations
+	var allocs []*structs.Allocation
+	var err error
+	err = c.stateDB.View(func(tx *bolt.Tx) error {
+		allocs, err = clientstate.GetAllAllocations(tx)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to list allocations: %v", err)
 		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	// Load each alloc back
 	var mErr multierror.Error
-	for _, allocID := range allocs {
-		restored, err := state.Restore(c.stateDB, allocID)
-		if err != nil {
-			c.logger.Printf("[ERR] client: failed to restore state for alloc %q: %v", allocID, err)
-			mErr.Errors = append(mErr.Errors, err)
-			continue
-		}
-
+	for _, alloc := range allocs {
 		//XXX FIXME create a root logger
 		logger := hclog.New(&hclog.LoggerOptions{
 			Name:       "nomad",
@@ -778,48 +757,46 @@ func (c *Client) restoreState() error {
 
 		c.configLock.RLock()
 		arConf := &allocrunnerv2.Config{
-			Alloc:         restored.Alloc,
-			Logger:        logger,
-			ClientConfig:  c.config,
-			StateDB:       c.stateDB,
-			RestoredTasks: restored.Tasks,
+			Alloc:        alloc,
+			Logger:       logger,
+			ClientConfig: c.config,
+			StateDB:      c.stateDB,
 		}
 		c.configLock.RUnlock()
 
-		ar := allocrunnerv2.NewAllocRunner(arConf)
-
-		go ar.Run()
-
-		//c.configLock.RLock()
-		//ar := allocrunner.NewAllocRunner(c.logger, c.configCopy.Copy(), c.stateDB, c.updateAllocStatus, alloc, c.vaultClient, c.consulService, watcher)
-		//c.configLock.RUnlock()
-
-		c.allocLock.Lock()
-		c.allocs[allocID] = ar
-		c.allocLock.Unlock()
-
-		//if err := ar.RestoreState(); err != nil {
-		//	c.logger.Printf("[ERR] client: failed to restore state for alloc %q: %v", id, err)
-		//	mErr.Errors = append(mErr.Errors, err)
-		//} else {
-		//	go ar.Run()
-
-		//	if upgrading {
-		//		if err := ar.SaveState(); err != nil {
-		//			c.logger.Printf("[WARN] client: initial save state for alloc %q failed: %v", id, err)
-		//		}
-		//	}
-		//}
-	}
-
-	// Delete all the entries
-	if upgrading {
-		if err := os.RemoveAll(allocDir); err != nil {
+		ar, err := allocrunnerv2.NewAllocRunner(arConf)
+		if err != nil {
+			c.logger.Printf("[ERR] client: failed to create alloc %q: %v", alloc.ID, err)
 			mErr.Errors = append(mErr.Errors, err)
+			continue
 		}
+
+		// Restore state
+		if err := ar.Restore(); err != nil {
+			c.logger.Printf("[ERR] client: failed to restore alloc %q: %v", alloc.ID, err)
+			mErr.Errors = append(mErr.Errors, err)
+			continue
+		}
+
+		//XXX is this locking necessary?
+		c.allocLock.Lock()
+		c.allocs[alloc.ID] = ar
+		c.allocLock.Unlock()
 	}
 
-	return mErr.ErrorOrNil()
+	// Don't run any allocs if there were any failures
+	//XXX removing this check would switch from all-or-nothing restores to
+	//    best-effort. went with all-or-nothing for now
+	if err := mErr.ErrorOrNil(); err != nil {
+		return err
+	}
+
+	// All allocs restored successfully, run them!
+	for _, ar := range c.allocs {
+		go ar.Run()
+	}
+
+	return nil
 }
 
 // saveState is used to snapshot our state into the data dir.
@@ -1989,12 +1966,15 @@ func (c *Client) addAlloc(alloc *structs.Allocation, migrateToken string) error 
 	}
 	c.configLock.RUnlock()
 
-	ar := allocrunnerv2.NewAllocRunner(arConf)
+	ar, err := allocrunnerv2.NewAllocRunner(arConf)
+	if err != nil {
+		return err
+	}
 
 	// Store the alloc runner.
 	c.allocs[alloc.ID] = ar
 
-	//XXX(schmichael) Why do we do this?
+	// Initialize local state
 	if err := ar.SaveState(); err != nil {
 		c.logger.Printf("[WARN] client: initial save state for alloc %q failed: %v", alloc.ID, err)
 	}

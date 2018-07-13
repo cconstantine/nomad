@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/nomad/client/allocrunnerv2/interfaces"
 	"github.com/hashicorp/nomad/client/allocrunnerv2/state"
 	"github.com/hashicorp/nomad/client/allocrunnerv2/taskrunner"
+	trstate "github.com/hashicorp/nomad/client/allocrunnerv2/taskrunner/state"
 	"github.com/hashicorp/nomad/client/config"
 	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/nomad/structs"
@@ -48,6 +49,9 @@ type allocRunner struct {
 	// tasks are the set of task runners
 	tasks map[string]*taskrunner.TaskRunner
 
+	//XXX spike to see if restore should just go through New funcs
+	restoredTasks map[string]*trstate.LocalState
+
 	// updateCh receives allocation updates via the Update method
 	updateCh chan *structs.Allocation
 }
@@ -55,12 +59,17 @@ type allocRunner struct {
 // NewAllocRunner returns a new allocation runner.
 func NewAllocRunner(config *Config) *allocRunner {
 	ar := &allocRunner{
-		alloc:        config.Alloc,
-		clientConfig: config.ClientConfig,
-		tasks:        make(map[string]*taskrunner.TaskRunner),
-		waitCh:       make(chan struct{}),
-		updateCh:     make(chan *structs.Allocation),
-		stateDB:      config.StateDB,
+		alloc:         config.Alloc,
+		clientConfig:  config.ClientConfig,
+		tasks:         make(map[string]*taskrunner.TaskRunner),
+		waitCh:        make(chan struct{}),
+		updateCh:      make(chan *structs.Allocation),
+		stateDB:       config.StateDB,
+		restoredTasks: config.RestoredTasks,
+	}
+
+	if ar.restoredTasks == nil {
+		ar.restoredTasks = make(map[string]*trstate.LocalState)
 	}
 
 	// Create alloc dir
@@ -164,6 +173,7 @@ func (ar *allocRunner) runTask(alloc *structs.Allocation, task *structs.Task) er
 		TaskDir:      ar.allocDir.NewTaskDir(task.Name),
 		Logger:       ar.logger,
 		StateDB:      ar.stateDB,
+		LocalState:   ar.restoredTasks[task.Name],
 	}
 	tr, err := taskrunner.NewTaskRunner(config)
 	if err != nil {

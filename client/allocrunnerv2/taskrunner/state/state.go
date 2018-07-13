@@ -1,8 +1,19 @@
 package state
 
 import (
+	"fmt"
+
+	"github.com/boltdb/bolt"
+	oldstate "github.com/hashicorp/nomad/client/state"
 	"github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/helper"
+)
+
+var (
+	// taskRunnerStateAllKey holds all the task runners state. At the moment
+	// there is no need to split it
+	//XXX refactor out of oldstate and taskrunner
+	taskRunnerStateAllKey = []byte("simple-all")
 )
 
 // LocalState is Task state which is persisted for use when restarting Nomad
@@ -65,4 +76,19 @@ func (h *HookState) Equal(o *HookState) bool {
 	}
 
 	return helper.CompareMapStringString(h.Data, o.Data)
+}
+
+// Restore local task runner state from a bolt transaction.
+func Restore(tx *bolt.Tx, allocID, taskName string) (*LocalState, error) {
+	bkt, err := oldstate.GetTaskBucket(tx, allocID, taskName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get task bucket: %v", err)
+	}
+
+	var ls LocalState
+	if err := oldstate.GetObject(bkt, taskRunnerStateAllKey, &ls); err != nil {
+		return nil, fmt.Errorf("failed to read task runner state: %v", err)
+	}
+
+	return &ls, nil
 }

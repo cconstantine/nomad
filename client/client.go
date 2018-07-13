@@ -24,10 +24,11 @@ import (
 	"github.com/hashicorp/nomad/client/allocdir"
 	"github.com/hashicorp/nomad/client/allocrunner"
 	"github.com/hashicorp/nomad/client/allocrunnerv2"
+	"github.com/hashicorp/nomad/client/allocrunnerv2/state"
 	"github.com/hashicorp/nomad/client/config"
 	consulApi "github.com/hashicorp/nomad/client/consul"
 	"github.com/hashicorp/nomad/client/servers"
-	"github.com/hashicorp/nomad/client/state"
+	oldstate "github.com/hashicorp/nomad/client/state"
 	"github.com/hashicorp/nomad/client/stats"
 	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/client/vaultclient"
@@ -747,7 +748,7 @@ func (c *Client) restoreState() error {
 	} else {
 		// Normal path
 		err := c.stateDB.View(func(tx *bolt.Tx) error {
-			allocs, err = state.GetAllAllocationIDs(tx)
+			allocs, err = oldstate.GetAllAllocationIDs(tx)
 			if err != nil {
 				return fmt.Errorf("failed to list allocations: %v", err)
 			}
@@ -760,32 +761,55 @@ func (c *Client) restoreState() error {
 
 	// Load each alloc back
 	var mErr multierror.Error
-	for _, id := range allocs {
-		alloc := &structs.Allocation{ID: id}
+	for _, allocID := range allocs {
+		restored, err := state.Restore(c.stateDB, allocID)
+		if err != nil {
+			c.logger.Printf("[ERR] client: failed to restore state for alloc %q: %v", allocID, err)
+			mErr.Errors = append(mErr.Errors, err)
+			continue
+		}
 
-		// don't worry about blocking/migrating when restoring
-		watcher := allocrunner.NoopPrevAlloc{}
+		//XXX FIXME create a root logger
+		logger := hclog.New(&hclog.LoggerOptions{
+			Name:       "nomad",
+			Level:      hclog.LevelFromString(c.configCopy.LogLevel),
+			TimeFormat: time.RFC3339,
+		})
 
 		c.configLock.RLock()
-		ar := allocrunner.NewAllocRunner(c.logger, c.configCopy.Copy(), c.stateDB, c.updateAllocStatus, alloc, c.vaultClient, c.consulService, watcher)
+		arConf := &allocrunnerv2.Config{
+			Alloc:         restored.Alloc,
+			Logger:        logger,
+			ClientConfig:  c.config,
+			StateDB:       c.stateDB,
+			RestoredTasks: restored.Tasks,
+		}
 		c.configLock.RUnlock()
 
+		ar := allocrunnerv2.NewAllocRunner(arConf)
+
+		go ar.Run()
+
+		//c.configLock.RLock()
+		//ar := allocrunner.NewAllocRunner(c.logger, c.configCopy.Copy(), c.stateDB, c.updateAllocStatus, alloc, c.vaultClient, c.consulService, watcher)
+		//c.configLock.RUnlock()
+
 		c.allocLock.Lock()
-		c.allocs[id] = ar
+		c.allocs[allocID] = ar
 		c.allocLock.Unlock()
 
-		if err := ar.RestoreState(); err != nil {
-			c.logger.Printf("[ERR] client: failed to restore state for alloc %q: %v", id, err)
-			mErr.Errors = append(mErr.Errors, err)
-		} else {
-			go ar.Run()
+		//if err := ar.RestoreState(); err != nil {
+		//	c.logger.Printf("[ERR] client: failed to restore state for alloc %q: %v", id, err)
+		//	mErr.Errors = append(mErr.Errors, err)
+		//} else {
+		//	go ar.Run()
 
-			if upgrading {
-				if err := ar.SaveState(); err != nil {
-					c.logger.Printf("[WARN] client: initial save state for alloc %q failed: %v", id, err)
-				}
-			}
-		}
+		//	if upgrading {
+		//		if err := ar.SaveState(); err != nil {
+		//			c.logger.Printf("[WARN] client: initial save state for alloc %q failed: %v", id, err)
+		//		}
+		//	}
+		//}
 	}
 
 	// Delete all the entries
@@ -1949,10 +1973,11 @@ func (c *Client) addAlloc(alloc *structs.Allocation, migrateToken string) error 
 	// The long term fix is to pass in the config and node separately and then
 	// we don't have to do a copy.
 	//ar := allocrunner.NewAllocRunner(c.logger, c.configCopy.Copy(), c.stateDB, c.updateAllocStatus, alloc, c.vaultClient, c.consulService, prevAlloc)
-	//XXX FIXME
+	//XXX FIXME create a root logger
 	logger := hclog.New(&hclog.LoggerOptions{
-		Name:  "nomad",
-		Level: hclog.LevelFromString(c.configCopy.LogLevel),
+		Name:       "nomad",
+		Level:      hclog.LevelFromString(c.configCopy.LogLevel),
+		TimeFormat: time.RFC3339,
 	})
 
 	c.configLock.RLock()

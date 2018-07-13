@@ -27,6 +27,7 @@ import (
 var (
 	// taskRunnerStateAllKey holds all the task runners state. At the moment
 	// there is no need to split it
+	//XXX refactor out of oldstate and new state
 	taskRunnerStateAllKey = []byte("simple-all")
 )
 
@@ -229,6 +230,7 @@ MAIN:
 			goto RESTART
 		}
 
+		//XXX rename pre/post start
 		// Run the postrun hooks
 		if err := tr.postrun(); err != nil {
 			tr.logger.Error("postrun failed", "error", err)
@@ -374,7 +376,7 @@ func (tr *TaskRunner) persistLocalState() error {
 	w := io.MultiWriter(h, &buf)
 
 	// Encode as msgpack value
-	if err := codec.NewEncoder(w, structs.MsgpackHandle).Encode(&tr.localState); err != nil {
+	if err := codec.NewEncoder(w, structs.MsgpackHandle).Encode(tr.localState); err != nil {
 		return fmt.Errorf("failed to serialize snapshot: %v", err)
 	}
 
@@ -384,8 +386,7 @@ func (tr *TaskRunner) persistLocalState() error {
 		return nil
 	}
 
-	// Start the transaction.
-	return tr.stateDB.Batch(func(tx *bolt.Tx) error {
+	return tr.stateDB.Update(func(tx *bolt.Tx) error {
 		// Grab the task bucket
 		//XXX move into new state pkg
 		taskBkt, err := oldstate.GetTaskBucket(tx, tr.allocID, tr.taskName)

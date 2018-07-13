@@ -86,19 +86,14 @@ func (tr *TaskRunner) prerun() error {
 
 		// Store the hook state
 		{
-			hookState, ok := tr.localState.Hooks[name]
-			if !ok {
-				hookState = &state.HookState{}
-				tr.localState.Hooks[name] = hookState
+			hookState := &state.HookState{
+				Data:       resp.HookData,
+				PrerunDone: resp.Done,
 			}
 
-			if resp.HookData != nil {
-				hookState.Data = resp.HookData
-				hookState.PrerunDone = resp.Done
-			}
-
-			// Persist local state if the hook state has changed
+			// Store and persist local state if the hook state has changed
 			if !hookState.Equal(origHookState) {
+				tr.localState.Hooks[name] = hookState
 				if err := tr.persistLocalState(); err != nil {
 					return err
 				}
